@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""
+Eksperyment 1: Akustyczny Sonar ToF (Time-of-Flight) - Wersja dla Termux (Android)
+Pomiar odległości za pomocą korelacji wzajemnej sygnału ćwierku (chirp).
+
+Wymagania w Termux:
+1. Pakiety Termux:
+   pkg install python python-numpy python-scipy termux-api
+2. Aplikacja pomocnicza na telefonie:
+   Zainstalowana aplikacja "Termux:API" (z F-Droid) z przyznanymi uprawnieniami do mikrofonu i pamięci.
+"""
+
+import sys
+import os
+import argparse
+import subprocess
+import time
+import shutil
+import numpy as np
+from scipy import signal
+from scipy.io import wavfile
+
+TEMP_TX_WAV = "/tmp/sonar_tx.wav"
+TEMP_RX_WAV = "/tmp/sonar_rx.wav"
+
+
+def check_termux_api():
+    """Sprawdza, czy polecenia termux-api są dostępne w systemie."""
+    cmds = ["termux-microphone-record", "termux-media-player"]
+    missing = [c for c in cmds if shutil.which(c) is None]
+    if missing:
+        print("[OSTRZEŻENIE] Brakujące polecenia Termux API:", ", ".join(missing))
+        print("Upewnij się, że wykonałeś:")
+        print("  pkg install termux-api")
+        print("oraz że masz zainstalowaną aplikację Termux:API (z F-Droid) z uprawnieniami do mikrofonu.")
+
+
+def generate_chirp_wav(filename, f_start=2000, f_end=8000, duration=0.080, fs=44100, pre_silence=0.05, post_silence=0.25):
+    """
+    Tworzy plik WAV z ćwierkiem o zadanym czasie trwania i pasmie częstotliwości,
+    otoczonym buforami ciszy.
+    """
+    n_chirp = int(fs * duration)
+    t = np.linspace(0, duration, n_chirp, endpoint=False)
+    chirp_raw = signal.chirp(t, f0=f_start, t1=duration, f1=f_end, method='linear')
+    window = signal.windows.tukey(n_chirp, alpha=0.1)
+    chirp = (chirp_raw * window).astype(np.float32)
+
+    n_pre = int(fs * pre_silence)
+    n_post = int(fs * post_silence)
+    tx_signal = np.pad(chirp, (n_pre, n_post), mode='constant')
+
+    # Konwersja na 16-bit PCM WAV
+    audio_int16 = np.int16(tx_signal * 32767)
+    wavfile.write(filename, fs, audio_int16)
+    return chirp, fs, n_pre
+
+
+def calculate_speed_of_sound(temperature_c=21.0):
+    """Oblicza prędkość dźwięku w powietrzu w m/s."""
+    return 331.3 * np.sqrt(1.0 + temperature_c / 273.15)
+
+
+def run_termux_sonar(
+    f_start=2000,
+    f_end=8000,
+    chirp_duration=0.080,
+    temperature_c=21.0,
+    calib_offset_m=0.0,
+    two_way=False
+):
+    c = calculate_speed_of_sound(temperature_c)
+    fs = 44100  # Domyślny stabilny próbnik w Android Termux
+
+    # 1. Generowanie wzorcowego ćwierku i pliku TX
+    pre_silence = 0.05
+    post_silence = 0.35
+    total_duration = pre_silence + chirp_duration + post_silence
+
+    chirp, fs, pre_samples = generate_chirp_wav(
+        TEMP_TX_WAV,
+        f_start=f_start,
+        f_end=f_end,
+        duration=chirp_duration,
+        fs=fs,
+        pre_silence=pre_silence,
+        post_silence=post_silence
+    )
+
+    # 2. Usuń stary plik nagrania jeśli istnieje
+    if os.path.exists(TEMP_RX_WAV):
+        try:
+            os.remove(TEMP_RX_WAV)
+        except OSError:
+            pass
+
+    print(f"[*] Prędkość dźwięku (T={temperature_c:.1f}°C): c = {c:.2f} m/s")
+    print(f"[*] Zakres ćwierku: {f_start} Hz - {f_end} Hz ({chirp_duration*1000:.0f} ms)")
+    print(f"[*] Rozpoczynanie nagrywania mikrofonem ({total_duration:.2f} s)...")
+
+    # Rozpocznij nagrywanie w tle przez termux-microphone-record
+    rec_time_limit = int(np.ceil(total_duration + 0.3))
+    # Uruchom nagrywanie
+    subprocess.run(["termux-microphone-record", "-f", TEMP_RX_WAV, "-l", str(rec_time_limit)], check=False)
+
+    time.sleep(0.08)  # Krótka pauza, by mikrofon zdążył wystartować
+
+    # 3. Odtwórz sygnał nadawczy
+    print("[*] Emisja ćwierku przez głośnik...")
+    subprocess.run(["termux-media-player", "play", TEMP_TX_WAV], check=False)
+
+    # Czekaj na zakończenie nagrywania
+    time.sleep(total_duration + 0.3)
+
+    # Zatrzymaj nagrywanie w razie potrzeby
+    subprocess.run(["termux-microphone-record", "-q"], check=False)
+
+    # 4. Sprawdzenie i wczytanie nagranego pliku
+    if not os.path.exists(TEMP_RX_WAV) or os.path.getsize(TEMP_RX_WAV) == 0:
+        print("\n[BŁĄD] Plik nagrania nie powstał lub jest pusty.")
+        print("Upewnij się, że aplikacja Termux:API posiada uprawnienie do Mikrofonu:")
+        print("Ustawienia telefonu -> Aplikacje -> Termux:API -> Uprawnienia -> Mikrofon (Zezwalaj).")
+        return
+
+    try:
+        sample_rate, rx_raw = wavfile.read(TEMP_RX_WAV)
+    except Exception as e:
+        print(f"[BŁĄD] Błąd odczytu pliku nagrania WAV: {e}")
+        return
+
+    # Sprowadzenie do mono i float32
+    if rx_raw.ndim > 1:
+        rx_raw = rx_raw.mean(axis=1)
+    rx_signal = rx_raw.astype(np.float32) / 32768.0
+
+    # Resampluj wzorzec jeśli system nagrał z inną częstotliwością niż 44.1 kHz
+    if sample_rate != fs:
+        num_samples = int(len(chirp) * sample_rate / fs)
+        chirp_resampled = signal.resample(chirp, num_samples)
+        pre_samples = int(pre_samples * sample_rate / fs)
+    else:
+        chirp_resampled = chirp
+
+    # 5. Filtracja pasmowoprzepustowa
+    nyquist = 0.5 * sample_rate
+    low_cut = max((f_start * 0.8) / nyquist, 0.01)
+    high_cut = min((f_end * 1.2) / nyquist, 0.99)
+    b, a = signal.butter(4, [low_cut, high_cut], btype='band')
+    rx_filtered = signal.filtfilt(b, a, rx_signal)
+
+    # 6. Korelacja wzajemna (filtr dopasowany)
+    correlation = signal.correlate(rx_filtered, chirp_resampled, mode='valid', method='fft')
+    corr_envelope = np.abs(signal.hilbert(correlation))
+    corr_envelope /= (np.max(corr_envelope) + 1e-12)
+
+    time_flight = (np.arange(len(corr_envelope)) - pre_samples) / sample_rate
+
+    # Wykrycie piku
+    valid_mask = time_flight >= 0
+    t_valid = time_flight[valid_mask]
+    corr_valid = corr_envelope[valid_mask]
+
+    peaks, properties = signal.find_peaks(corr_valid, height=0.3, distance=int(sample_rate * 0.002))
+    
+    if len(peaks) == 0:
+        best_peak_idx = np.argmax(corr_valid)
+    else:
+        best_peak_idx = peaks[np.argmax(properties['peak_heights'])]
+
+    tof_sec = t_valid[best_peak_idx]
+    divisor = 2.0 if two_way else 1.0
+    distance_raw_m = (tof_sec * c) / divisor
+    distance_calibrated_m = max(0.0, distance_raw_m - calib_offset_m)
+
+    mode_str = "Bezpośredni 1-way (Głośnik -> Mikrofon)" if not two_way else "Echo 2-way"
+    print("\n" + "="*50)
+    print(f"  WYNIK POMIARU (Android Termux: {mode_str})")
+    print("="*50)
+    print(f"  Czas przelotu (ToF):  {tof_sec * 1000.0:.2f} ms")
+    print(f"  Zmierzona odległość:  {distance_calibrated_m * 100.0:.2f} cm ({distance_calibrated_m:.3f} m)")
+    if calib_offset_m > 0:
+        print(f"  (Zastosowany offset: -{calib_offset_m * 100.0:.2f} cm)")
+    print("="*50 + "\n")
+
+    # Wypisanie alternatywnych pików
+    if len(peaks) > 1:
+        print("Wykryte echa / odbicia:")
+        for i, p in enumerate(peaks):
+            p_dist = (t_valid[p] * c) / divisor - calib_offset_m
+            marker = " <-- GŁÓWNY SYGNAŁ" if p == best_peak_idx else ""
+            print(f"  Pik #{i+1}: t = {t_valid[p]*1000.0:6.1f} ms | d = {p_dist*100.0:6.1f} cm | korelacja = {corr_valid[p]:.2f}{marker}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Akustyczny Sonar ToF dla Androida (Termux)")
+    parser.add_argument("--fmin", type=float, default=2000, help="Początek ćwierku Hz (domyślnie 2000)")
+    parser.add_argument("--fmax", type=float, default=8000, help="Koniec ćwierku Hz (domyślnie 8000)")
+    parser.add_argument("--duration", type=float, default=0.080, help="Czas trwania w sekundach (domyślnie 0.08s)")
+    parser.add_argument("--temp", type=float, default=21.0, help="Temperatura w °C (domyślnie 21.0)")
+    parser.add_argument("--offset", type=float, default=0.0, help="Offset kalibracyjny w metrach")
+    parser.add_argument("--echo", action="store_true", help="Tryb 2-way echa (odbicia od ściany)")
+    args = parser.parse_args()
+
+    check_termux_api()
+    run_termux_sonar(
+        f_start=args.fmin,
+        f_end=args.fmax,
+        chirp_duration=args.duration,
+        temperature_c=args.temp,
+        calib_offset_m=args.offset,
+        two_way=args.echo
+    )
+
+
+if __name__ == "__main__":
+    main()
+
