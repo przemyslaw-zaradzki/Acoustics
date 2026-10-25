@@ -10,8 +10,9 @@ Wymagania w Termux:
    Zainstalowana aplikacja "Termux:API" (z F-Droid) z przyznanymi uprawnieniami do mikrofonu i pamięci.
 """
 
-import sys
 import os
+import sys
+import tempfile
 import argparse
 import subprocess
 import time
@@ -20,8 +21,14 @@ import numpy as np
 from scipy import signal
 from scipy.io import wavfile
 
-TEMP_TX_WAV = "/tmp/sonar_tx.wav"
-TEMP_RX_WAV = "/tmp/sonar_rx.wav"
+# Na Androidzie /tmp jest zablokowane przez SELinux.
+# Używamy zmiennej $PREFIX/tmp lub standardowego katalogu tymczasowego Termux.
+TMP_DIR = os.environ.get("TMPDIR", os.environ.get("PREFIX", "") + "/tmp" if os.environ.get("PREFIX") else tempfile.gettempdir())
+if not os.path.exists(TMP_DIR):
+    os.makedirs(TMP_DIR, exist_ok=True)
+
+TEMP_TX_WAV = os.path.join(TMP_DIR, "sonar_tx.wav")
+TEMP_RX_WAV = os.path.join(TMP_DIR, "sonar_rx.wav")
 
 
 def check_termux_api():
@@ -29,10 +36,17 @@ def check_termux_api():
     cmds = ["termux-microphone-record", "termux-media-player"]
     missing = [c for c in cmds if shutil.which(c) is None]
     if missing:
-        print("[OSTRZEŻENIE] Brakujące polecenia Termux API:", ", ".join(missing))
-        print("Upewnij się, że wykonałeś:")
-        print("  pkg install termux-api")
-        print("oraz że masz zainstalowaną aplikację Termux:API (z F-Droid) z uprawnieniami do mikrofonu.")
+        print("\n" + "!" * 60)
+        print("[BŁĄD] Brakujące polecenia Termux API:", ", ".join(missing))
+        print("Aby je zainstalować, wykonaj w konsoli Termux:")
+        print("    pkg install termux-api")
+        print("\nUpewnij się również, że:")
+        print(" 1. Zainstalowałeś aplikację 'Termux:API' z F-Droid.")
+        print(" 2. Nadałeś jej uprawnienia do Mikrofonu:")
+        print("    Ustawienia Androida -> Aplikacje -> Termux:API -> Uprawnienia -> Mikrofon (Zezwalaj)")
+        print("!" * 60 + "\n")
+        return False
+    return True
 
 
 def generate_chirp_wav(filename, f_start=2000, f_end=8000, duration=0.080, fs=44100, pre_silence=0.05, post_silence=0.25):
@@ -201,7 +215,8 @@ def main():
     parser.add_argument("--echo", action="store_true", help="Tryb 2-way echa (odbicia od ściany)")
     args = parser.parse_args()
 
-    check_termux_api()
+    if not check_termux_api():
+        sys.exit(1)
     run_termux_sonar(
         f_start=args.fmin,
         f_end=args.fmax,
