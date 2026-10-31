@@ -28,18 +28,19 @@ if not os.path.exists(TMP_DIR):
     os.makedirs(TMP_DIR, exist_ok=True)
 
 TEMP_TX_WAV = os.path.join(TMP_DIR, "sonar_tx.wav")
+TEMP_RX_RAW = os.path.join(TMP_DIR, "sonar_rx.m4a")
 TEMP_RX_WAV = os.path.join(TMP_DIR, "sonar_rx.wav")
 
 
 def check_termux_api():
-    """Sprawdza, czy polecenia termux-api są dostępne w systemie."""
-    cmds = ["termux-microphone-record", "termux-media-player"]
+    """Sprawdza, czy polecenia termux-api i ffmpeg są dostępne w systemie."""
+    cmds = ["termux-microphone-record", "termux-media-player", "ffmpeg"]
     missing = [c for c in cmds if shutil.which(c) is None]
     if missing:
         print("\n" + "!" * 60)
-        print("[BŁĄD] Brakujące polecenia Termux API:", ", ".join(missing))
+        print("[BŁĄD] Brakujące polecenia systemowe:", ", ".join(missing))
         print("Aby je zainstalować, wykonaj w konsoli Termux:")
-        print("    pkg install termux-api")
+        print("    pkg install termux-api ffmpeg")
         print("\nUpewnij się również, że:")
         print(" 1. Zainstalowałeś aplikację 'Termux:API' z F-Droid.")
         print(" 2. Nadałeś jej uprawnienia do Mikrofonu:")
@@ -101,23 +102,26 @@ def run_termux_sonar(
         post_silence=post_silence
     )
 
-    # 2. Usuń stary plik nagrania jeśli istnieje
-    if os.path.exists(TEMP_RX_WAV):
-        try:
-            os.remove(TEMP_RX_WAV)
-        except OSError:
-            pass
+    # 2. Usuń stare pliki nagrania jeśli istnieją
+    for f in [TEMP_RX_RAW, TEMP_RX_WAV]:
+        if os.path.exists(f):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
     print(f"[*] Prędkość dźwięku (T={temperature_c:.1f}°C): c = {c:.2f} m/s")
     print(f"[*] Zakres ćwierku: {f_start} Hz - {f_end} Hz ({chirp_duration*1000:.0f} ms)")
     print(f"[*] Rozpoczynanie nagrywania mikrofonem ({total_duration:.2f} s)...")
 
-    # Rozpocznij nagrywanie w tle przez termux-microphone-record
-    rec_time_limit = int(np.ceil(total_duration + 0.3))
-    # Uruchom nagrywanie
-    subprocess.run(["termux-microphone-record", "-f", TEMP_RX_WAV, "-l", str(rec_time_limit)], check=False)
+    # Rozpocznij nagrywanie w tle przez termux-microphone-record (koder aac, częstotliwość 44100 Hz)
+    rec_proc = subprocess.Popen(
+        ["termux-microphone-record", "-f", TEMP_RX_RAW, "-e", "aac", "-r", "44100"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
 
-    time.sleep(0.08)  # Krótka pauza, by mikrofon zdążył wystartować
+    time.sleep(0.15)  # Krótka pauza, by mikrofon zdążył wystartować
 
     # 3. Odtwórz sygnał nadawczy
     print("[*] Emisja ćwierku przez głośnik...")
@@ -126,14 +130,41 @@ def run_termux_sonar(
     # Czekaj na zakończenie nagrywania
     time.sleep(total_duration + 0.3)
 
-    # Zatrzymaj nagrywanie w razie potrzeby
+    # Zatrzymaj nagrywanie
     subprocess.run(["termux-microphone-record", "-q"], check=False)
+    try:
+        rec_proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        rec_proc.kill()
 
-    # 4. Sprawdzenie i wczytanie nagranego pliku
-    if not os.path.exists(TEMP_RX_WAV) or os.path.getsize(TEMP_RX_WAV) == 0:
+    # Daj Androidowi chwilę na flush i domknięcie pliku m4a (zapis kontenera moov)
+    time.sleep(0.3)
+
+    # 4. Sprawdzenie i konwersja nagranego pliku
+    # Czekaj max 2 sekundy aż plik pojawi się na dysku i nie będzie pusty
+    for _ in range(20):
+        if os.path.exists(TEMP_RX_RAW) and os.path.getsize(TEMP_RX_RAW) > 500:
+            break
+        time.sleep(0.1)
+
+    if not os.path.exists(TEMP_RX_RAW) or os.path.getsize(TEMP_RX_RAW) == 0:
         print("\n[BŁĄD] Plik nagrania nie powstał lub jest pusty.")
         print("Upewnij się, że aplikacja Termux:API posiada uprawnienie do Mikrofonu:")
         print("Ustawienia telefonu -> Aplikacje -> Termux:API -> Uprawnienia -> Mikrofon (Zezwalaj).")
+        return
+
+    # Konwersja AAC/M4A -> czysty nieskompresowany WAV (PCM 16-bit) przez ffmpeg
+    conv = subprocess.run(
+        ["ffmpeg", "-y", "-i", TEMP_RX_RAW, "-ar", str(fs), "-ac", "1", TEMP_RX_WAV],
+        capture_output=True,
+        text=True
+    )
+    if conv.returncode != 0 or not os.path.exists(TEMP_RX_WAV):
+        print("\n[BŁĄD] Konwersja nagrania do formatu WAV za pomocą ffmpeg nie powiodła się.")
+        if conv.stderr:
+            err_lines = [line for line in conv.stderr.splitlines() if "Error" in line or "Invalid" in line]
+            if err_lines:
+                print("Szczegóły:", "\n".join(err_lines))
         return
 
     try:
